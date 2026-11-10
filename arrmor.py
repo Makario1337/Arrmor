@@ -25,14 +25,15 @@ import urllib.parse
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 log = logging.getLogger("arrmor")
 
 # --------------------------------------------------------------------------
 # Allow-list: everything Seerr needs to *display* the library and test the
 # connection. Patterns are matched against the full path (after the instance
-# prefix has been removed), case-sensitive, without query string.
+# prefix has been removed), case-insensitive (like Sonarr/Radarr routing),
+# without query string.
 # --------------------------------------------------------------------------
 _COMMON = [
     r"/api/v3/system/status",  # connection test, version detection
@@ -175,7 +176,7 @@ def load_config(env: dict[str, str]) -> Config:
         extra = get("EXTRA_ALLOW", required=False)
         patterns += [p.strip() for p in extra.split(",") if p.strip()]
         try:
-            allow = [re.compile(p) for p in patterns]
+            allow = [re.compile(p, re.IGNORECASE) for p in patterns]
         except re.error as e:
             raise ConfigError(f"ARRMOR_{name}_EXTRA_ALLOW contains an invalid regex: {e}")
 

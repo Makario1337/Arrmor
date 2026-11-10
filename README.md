@@ -73,7 +73,12 @@ docker run -d --name arrmor --read-only \
   ghcr.io/makario1337/arrmor:latest
 ```
 
-See [docker-compose.example.yml](docker-compose.example.yml) for a setup where Arrmor runs in the same compose stack as Sonarr/Radarr.
+See [docker-compose.example.yml](docker-compose.example.yml) for a setup where Arrmor runs in the same compose stack as Sonarr/Radarr. It reads the keys from a `.env` file next to it — copy [.env.example](.env.example) to `.env` and fill it in:
+
+```sh
+cp .env.example .env
+openssl rand -hex 32   # run twice, once for SONARR_PROXY_KEY and once for RADARR_PROXY_KEY
+```
 
 ### Seerr settings
 

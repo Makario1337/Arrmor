@@ -107,6 +107,13 @@ class ArrmorTest(unittest.TestCase):
             resp, _ = self.req("GET", p, {"X-Api-Key": RADARR_PROXY})
             self.assertEqual(resp.status, 200, p)
 
+    def test_case_insensitive_paths(self):
+        # Seerr requests e.g. /api/v3/qualityProfile and /api/v3/rootFolder
+        for p in ("/radarr/api/v3/qualityProfile", "/radarr/api/v3/rootFolder",
+                  "/radarr/api/v3/System/Status"):
+            resp, _ = self.req("GET", p, {"X-Api-Key": RADARR_PROXY})
+            self.assertEqual(resp.status, 200, p)
+
     def test_head(self):
         resp, _ = self.req("HEAD", "/sonarr/api/v3/system/status", {"X-Api-Key": SONARR_PROXY})
         self.assertEqual(resp.status, 200)
@@ -148,7 +155,7 @@ class ArrmorTest(unittest.TestCase):
         for p in ("/sonarr/api/v3/config/host", "/sonarr/api/v3/indexer",
                   "/sonarr/api/v3/downloadclient", "/sonarr/api/v3/system/backup",
                   "/sonarr/api/v3/log/file", "/sonarr/", "/sonarr", "/sonarr/api/v3/CONFIG/host",
-                  "/sonarr/api/v3/Series", "/sonarr/api/v3/series/1/x", "/sonarr/api/v3/movie"):
+                  "/sonarr/api/v3/IndeXer", "/sonarr/api/v3/series/1/x", "/sonarr/api/v3/movie"):
             self.assertBlocked(403, "GET", p, h)
 
     def test_path_tricks_denied(self):
