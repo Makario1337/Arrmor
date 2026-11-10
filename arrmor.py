@@ -21,15 +21,17 @@ import os
 import re
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import sys
+import threading
 import urllib.parse
 import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.0"
+VERSION = "1.0.0"
 
 log = logging.getLogger("arrmor")
 
@@ -96,6 +98,17 @@ CREDENTIAL_PARAMS = {"apikey", "access_token"}
 # Strict character set for request paths. No percent-encoding, no dots,
 # no backslashes -> no traversal or normalization tricks.
 SAFE_PATH = re.compile(r"/[A-Za-z0-9_\-/]*")
+# Query strings: URL-safe characters only, limited length.
+SAFE_QUERY = re.compile(r"[A-Za-z0-9_\-.~%+=&:,*]*")
+MAX_QUERY = 2048
+
+# Cheap pre-check: only parse/redact JSON that has a credential-like key
+# ("...key/pass/token...": ) or a provider field {"name": "...key..."}.
+_SENSITIVE_HINT = re.compile(
+    rb'"[^"]{0,64}(key|pass|secret|token|cookie|session|auth|credential)[^"]{0,64}"\s*:'
+    rb'|"name"\s*:\s*"[^"]{0,64}(key|pass|secret|token|cookie|session|auth|credential)',
+    re.IGNORECASE)
+_UNPRINTABLE = re.compile(r"[^\x21-\x7e]")
 
 
 class ConfigError(Exception):
@@ -243,7 +256,9 @@ class Config:
     allowed_clients: list = field(default_factory=list)  # empty = everyone
     tls: ssl.SSLContext | None = None  # None = plain HTTP
     tls_cert: str | None = None  # set when self-signed, for logging
-    max_response: int = 256 * 1024 * 1024
+    max_response: int = 64 * 1024 * 1024
+    max_connections: int = 32
+    max_upstream: int = 4
 
     @property
     def secrets(self) -> list[str]:
@@ -338,9 +353,14 @@ def load_config(env: dict[str, str]) -> Config:
     try:
         port = int(env.get("ARRMOR_PORT", "8080"))
         timeout = float(env.get("ARRMOR_TIMEOUT", "60"))
-        max_response = int(float(env.get("ARRMOR_MAX_RESPONSE_MB", "256")) * 1024 * 1024)
+        max_response = int(float(env.get("ARRMOR_MAX_RESPONSE_MB", "64")) * 1024 * 1024)
+        max_connections = int(env.get("ARRMOR_MAX_CONNECTIONS", "32"))
+        max_upstream = int(env.get("ARRMOR_MAX_UPSTREAM", "4"))
     except ValueError:
-        raise ConfigError("ARRMOR_PORT / ARRMOR_TIMEOUT / ARRMOR_MAX_RESPONSE_MB must be numbers")
+        raise ConfigError("ARRMOR_PORT / ARRMOR_TIMEOUT / ARRMOR_MAX_* must be numbers")
+    if min(port, max_response, max_connections, max_upstream) < 0 or timeout <= 0 \
+            or min(max_response, max_connections, max_upstream) == 0:
+        raise ConfigError("ARRMOR_PORT / ARRMOR_TIMEOUT / ARRMOR_MAX_* must be positive")
 
     allowed_clients = []
     for entry in env.get("ARRMOR_ALLOWED_CLIENTS", "").split(","):
@@ -385,11 +405,14 @@ def load_config(env: dict[str, str]) -> Config:
         tls=tls,
         tls_cert=tls_cert,
         max_response=max_response,
+        max_connections=max_connections,
+        max_upstream=max_upstream,
     )
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 60  # idle/read timeout per connection (slowloris protection)
     config: Config  # set by make_server()
 
     def version_string(self) -> str:
@@ -409,8 +432,9 @@ class Handler(BaseHTTPRequestHandler):
                         self.client_address[0], self.command, self._log_path(), status, reason)
 
     def _log_path(self) -> str:
-        # Never log the query string - it may contain an API key.
-        return self.path.partition("?")[0][:200]
+        # Never log the query string - it may contain an API key. Escape
+        # anything unprintable so requests cannot forge log lines.
+        return _UNPRINTABLE.sub("?", self.path.partition("?")[0][:200])
 
     def log_message(self, fmt: str, *args) -> None:  # silence default logging
         pass
@@ -460,6 +484,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if not SAFE_PATH.fullmatch(raw_path) or "//" in raw_path:
             return self._reply(400, "invalid path", reason="unsafe path")
+        if len(raw_query) > MAX_QUERY or not SAFE_QUERY.fullmatch(raw_query):
+            return self._reply(400, "invalid query", reason="unsafe query string")
 
         inst = next(
             (i for i in self.config.instances
@@ -470,9 +496,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(404, "unknown instance", reason="unknown prefix")
 
         # Collect credentials from header and query, drop them from the query.
-        presented = []
-        if (h := self.headers.get("X-Api-Key")) is not None:
-            presented.append(h)
+        presented = list(self.headers.get_all("X-Api-Key") or [])
         kept = []
         for pair in raw_query.split("&") if raw_query else []:
             key, _, value = pair.partition("=")
@@ -506,6 +530,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             conn = http.client.HTTPConnection(inst.host, inst.port, timeout=self.config.timeout)
 
+        # Limit parallel upstream requests: every response is buffered in
+        # memory, so this bounds RAM usage and load on Sonarr/Radarr.
+        if not self.server.upstream_slots.acquire(timeout=self.config.timeout):
+            return self._reply(503, "busy", reason="too many parallel requests")
         try:
             try:
                 conn.request(self.command, target, headers=headers)
@@ -514,10 +542,31 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, http.client.HTTPException) as e:
                 log.error("upstream %s unreachable: %s", inst.name, e)
                 return self._reply(502, "upstream unreachable")
+            finally:
+                conn.close()
+            return self._relay(inst, sub_path, resp, body)
         finally:
-            conn.close()
+            self.server.upstream_slots.release()
+
+    def _relay(self, inst: Instance, sub_path: str, resp: http.client.HTTPResponse, body: bytes) -> None:
 
         logged_path = inst.prefix + sub_path
+
+        # Upstream errors: pass the status, but not the body (stack traces,
+        # paths, ...). Seerr only looks at the status code.
+        if resp.status >= 400:
+            if resp.status == 401:
+                log.error("%s rejected Arrmor's API key - check ARRMOR_%s_API_KEY",
+                          inst.name, inst.name.upper())
+            else:
+                log.warning("%s %s %s -> upstream %d", self.client_address[0], self.command,
+                            logged_path, resp.status)
+            status = 502 if resp.status in (401, 403) else resp.status
+            return self._reply(status, f"upstream error {resp.status}")
+        if 300 <= resp.status < 400:
+            log.warning("%s %s -> upstream redirect %d dropped", self.command, logged_path, resp.status)
+            return self._reply(502, "unexpected upstream redirect")
+
         if len(body) > self.config.max_response:
             log.error("response from %s for %s exceeds ARRMOR_MAX_RESPONSE_MB", inst.name, logged_path)
             return self._reply(502, "upstream response too large")
@@ -537,12 +586,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(502, "invalid upstream response")
 
         # Layer 2: redact credential-like JSON fields.
-        if body and "json" in (resp.getheader("Content-Type") or "").lower():
+        if (body and "json" in (resp.getheader("Content-Type") or "").lower()
+                and _SENSITIVE_HINT.search(body)):
             try:
                 data = json.loads(body)
-            except ValueError:
-                data = None
-            if data is not None and (n := redact(data)):
+                n = redact(data)
+            except (ValueError, RecursionError):
+                data, n = None, 0
+            if n:
                 body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
                 log.warning("REDACTED %d credential field(s) in response %s %s",
                             n, self.command, logged_path)
@@ -576,16 +627,60 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 64
     tls: ssl.SSLContext | None = None
+    config: Config
+    connection_slots: threading.BoundedSemaphore
+    upstream_slots: threading.BoundedSemaphore
+
+    def verify_request(self, request, client_address) -> bool:
+        # Drop connections from foreign IPs before TLS or HTTP parsing.
+        ip = client_address[0]
+        if self.config.client_allowed(ip):
+            return True
+        try:
+            if ipaddress.ip_address(ip).is_loopback:  # local healthcheck
+                return True
+        except ValueError:
+            pass
+        log.warning("BLOCKED connection from %s (client IP not allowed)", ip)
+        return False
+
+    def process_request(self, request, client_address) -> None:
+        if not self.connection_slots.acquire(blocking=False):
+            log.warning("BLOCKED connection from %s (too many connections)", client_address[0])
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
 
     def finish_request(self, request, client_address) -> None:
         # Runs in the per-connection thread, so a slow TLS handshake never
         # blocks accepting other connections.
-        if self.tls is not None:
-            request.settimeout(30)
-            request = self.tls.wrap_socket(request, server_side=True)
-            request.settimeout(None)
-        super().finish_request(request, client_address)
+        if self.tls is None:
+            return super().finish_request(request, client_address)
+        # wrap_socket() detaches the plain socket, so shutdown_request() would
+        # not close the TLS socket - close it here explicitly.
+        tls_sock = self.tls.wrap_socket(request, server_side=True, do_handshake_on_connect=False)
+        try:
+            tls_sock.settimeout(30)
+            tls_sock.do_handshake()
+            super().finish_request(tls_sock, client_address)
+        finally:
+            try:
+                tls_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            tls_sock.close()
 
     def handle_error(self, request, client_address) -> None:
         exc = sys.exc_info()[1]
@@ -599,6 +694,9 @@ def make_server(config: Config) -> ThreadingHTTPServer:
     handler = type("ConfiguredHandler", (Handler,), {"config": config})
     server = Server((config.host, config.port), handler)
     server.tls = config.tls
+    server.config = config
+    server.connection_slots = threading.BoundedSemaphore(config.max_connections)
+    server.upstream_slots = threading.BoundedSemaphore(config.max_upstream)
     return server
 
 

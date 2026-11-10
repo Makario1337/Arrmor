@@ -19,6 +19,11 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m unittest discover -s tests -v
+      - name: Tag matches VERSION in arrmor.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(python -c 'import arrmor; print(arrmor.VERSION)')
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != VERSION $v"; exit 1; }
 
   image:
     needs: test
@@ -27,6 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Smoke test image (self-signed TLS)
         run: |
+          set -x
           docker build -t arrmor:test .
           docker volume create arrmor-certs
           docker run -d --name arrmor-test -p 8443:8080 \
@@ -39,7 +45,12 @@ jobs:
           docker logs arrmor-test
           docker cp arrmor-test:/certs/arrmor.crt arrmor.crt
           curl --fail --silent --show-error --cacert arrmor.crt https://127.0.0.1:8443/healthz
-          docker exec arrmor-test python /app/arrmor.py --healthcheck
+          docker exec arrmor-test python -I /app/arrmor.py --healthcheck
+          # no key -> 401, write method -> 405, plain HTTP -> fails
+          test "$(curl -s -o /dev/null -w '%{http_code}' --cacert arrmor.crt https://127.0.0.1:8443/radarr/api/v3/movie)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' --cacert arrmor.crt -X DELETE https://127.0.0.1:8443/radarr/api/v3/movie/1)" = 405
+          if curl -s --max-time 5 http://127.0.0.1:8443/healthz; then echo "plain HTTP must fail"; exit 1; fi
+          docker exec arrmor-test id -u | grep -qx 65534
           # restart keeps the certificate
           docker restart arrmor-test && sleep 3
           docker cp arrmor-test:/certs/arrmor.crt arrmor2.crt
@@ -60,6 +71,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=edge,branch=main
             type=sha
@@ -70,3 +82,18 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "Arrmor $GITHUB_REF_NAME"

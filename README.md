@@ -28,16 +28,24 @@ Arrmor runs next to Sonarr/Radarr. The only thing the DMZ can reach is Arrmor's 
   | `/api/v3/episode`, `/api/v3/episode/{id}` | |
   | `/api/v3/languageprofile` | |
 
-  Anything else returns `403`. Paths with `..`, `%`-encoding, `//`, `;` etc. are rejected (`400`).
+  Anything else returns `403`. Paths with `..`, `%`-encoding, `//`, `;` etc. and query strings with unusual characters or > 2 KB are rejected (`400`).
 - **Credential filter on every response.** Even the allowed endpoints are not trusted blindly:
   - JSON fields that look like credentials (`apiKey`, `password`, `token`, `secret`, `passkey`, … — also in the *arr provider format `{"name": "apiKey", "value": …}`) are replaced with `********`.
   - If a real Sonarr/Radarr API key still appears anywhere in a response (any field, any case, JSON or not), the response is not delivered at all (`502`) and an error is logged.
   - For this, responses are fetched uncompressed and checked as a whole before they are sent (limit: `ARRMOR_MAX_RESPONSE_MB`).
 - **Separate keys.** Every instance has its own proxy key. Seerr only knows the proxy key; Arrmor swaps it for the real key. Proxy keys from the query string (`?apikey=`) are stripped before forwarding.
-- **Client IP allow-list.** With `ARRMOR_ALLOWED_CLIENTS` only the Seerr host may talk to Arrmor at all (`403` otherwise) — a second layer behind the firewall.
-- **Header hygiene.** Only a handful of request/response headers are passed through (no cookies, no `Location`, no `Server`).
-- **Logging.** Every blocked request is logged with the reason — handy to see what Seerr tried to do. Query strings are never logged.
-- **Tiny.** One Python file, standard library only, runs as `nobody`, works with a read-only root filesystem.
+- **Client IP allow-list.** With `ARRMOR_ALLOWED_CLIENTS` connections from any other IP are dropped right away, before TLS or HTTP is even parsed — a second layer behind the firewall.
+- **No information leaks.** Only a handful of request/response headers are passed through (no cookies, no `Location`, no `Server`). Error pages of Sonarr/Radarr (stack traces, paths) are replaced by a generic error with the same status code; redirects and upstream auth errors become `502`.
+- **Resource limits.** A compromised Seerr cannot exhaust the arr server: max. `ARRMOR_MAX_CONNECTIONS` connections, max. `ARRMOR_MAX_UPSTREAM` parallel requests to Sonarr/Radarr (others wait), response size limit, 60 s idle timeout per connection.
+- **Logging.** Every blocked request is logged with the reason — handy to see what Seerr tried to do. Query strings are never logged, control characters are escaped.
+- **Tiny.** One Python file, standard library only, runs as `nobody` in isolated mode, works with a read-only root filesystem.
+
+### Security model
+
+| If an attacker… | …they can | …they cannot |
+|---|---|---|
+| owns Seerr (incl. the proxy key) | list your library, quality profiles, root folders, queue | add, request, search, change or delete anything; read API keys, indexer/download client credentials, config, logs or backups; reach Sonarr/Radarr directly (with the firewall rule) |
+| sits elsewhere in the DMZ | — | connect at all (`ARRMOR_ALLOWED_CLIENTS`, firewall); sniff the proxy key (with [HTTPS](#https)) |
 
 ## Configuration
 
@@ -58,7 +66,9 @@ Each instance is defined by a group of environment variables. `<NAME>` is upperc
 | `ARRMOR_PORT` | no | Listen port, default `8080` |
 | `ARRMOR_HOST` | no | Listen address, default `0.0.0.0` |
 | `ARRMOR_TIMEOUT` | no | Upstream timeout in seconds, default `60` |
-| `ARRMOR_MAX_RESPONSE_MB` | no | Maximum upstream response size, default `256` (large libraries need a few MB) |
+| `ARRMOR_MAX_RESPONSE_MB` | no | Maximum upstream response size, default `64` (a library with thousands of titles needs a few MB) |
+| `ARRMOR_MAX_CONNECTIONS` | no | Maximum simultaneous client connections, default `32` |
+| `ARRMOR_MAX_UPSTREAM` | no | Maximum parallel requests to Sonarr/Radarr, default `4` |
 | `ARRMOR_LOG_LEVEL` | no | `DEBUG`, `INFO` (default), `WARNING` |
 
 Generate a proxy key with `openssl rand -hex 32`.
@@ -67,7 +77,7 @@ Multiple instances (e.g. a 4K Sonarr) are just another group: `ARRMOR_SONARR4K_U
 
 ## Usage
 
-Image tags: `latest` = newest release, `0.2.0` / `0.2` = specific release, `edge` = current `main`.
+Image tags: `latest` = newest release, `1` / `1.0` / `1.0.0` = pinned release, `edge` = current `main`. Images are built for `amd64`, `arm64` and `armv7`.
 
 ```sh
 docker run -d --name arrmor --read-only \
@@ -118,6 +128,10 @@ Watch `docker logs -f arrmor` while clicking **Test**:
 | `-> 403 (client IP not allowed)` | `ARRMOR_ALLOWED_CLIENTS` doesn't contain the IP Seerr connects from (the log shows that IP) |
 | `-> 403 (not on … allow-list)` | Seerr needs an endpoint Arrmor doesn't allow yet — please open an issue with the log line |
 | `upstream … unreachable` | Arrmor can't reach Sonarr/Radarr: check `ARRMOR_<NAME>_URL` |
+| `… rejected Arrmor's API key` | The real key in `ARRMOR_<NAME>_API_KEY` is wrong |
+| `BLOCKED connection from … (client IP not allowed)` | Same as above, rejected at connection level |
+| `BLOCKED connection … (too many connections)` / `503 busy` | Limits reached — raise `ARRMOR_MAX_CONNECTIONS` / `ARRMOR_MAX_UPSTREAM` if this happens in normal use |
+| `exceeds ARRMOR_MAX_RESPONSE_MB` | Very large library — raise `ARRMOR_MAX_RESPONSE_MB` |
 | `REDACTED n credential field(s) …` | Arrmor removed credential-like fields from a response. Harmless, but please report the endpoint |
 | `BLOCKED response … contains an API key` | A response contained a real API key and was dropped — please open an issue |
 | `GET /radarr/api/v3/system/status -> 200` | Connection works |

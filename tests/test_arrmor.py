@@ -3,11 +3,13 @@ import gzip
 import json
 import os
 import shutil
+import socket
 import ssl
 import subprocess
 import tempfile
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -29,6 +31,7 @@ class FakeArr(BaseHTTPRequestHandler):
     body = None  # override response body (bytes)
     content_type = "application/json"
     gzip = False
+    status = 200
 
     def log_message(self, *a):
         pass
@@ -36,7 +39,9 @@ class FakeArr(BaseHTTPRequestHandler):
     def _any(self):
         FakeArr.requests.append((self.command, self.path, dict(self.headers)))
         body = FakeArr.body if FakeArr.body is not None else json.dumps({"path": self.path}).encode()
-        self.send_response(200)
+        self.send_response(FakeArr.status)
+        if 300 <= FakeArr.status < 400:
+            self.send_header("Location", "http://internal-sonarr:8989/login")
         self.send_header("Content-Type", FakeArr.content_type)
         if FakeArr.gzip:
             body = gzip.compress(body)
@@ -88,6 +93,7 @@ class ArrmorTest(unittest.TestCase):
         FakeArr.body = None
         FakeArr.content_type = "application/json"
         FakeArr.gzip = False
+        FakeArr.status = 200
 
     def req(self, method, path, headers=None, body=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=5)
@@ -206,6 +212,47 @@ class ArrmorTest(unittest.TestCase):
         resp, _ = self.get_sonarr()
         self.assertEqual(resp.status, 502)
 
+    # ------------------------------------------------------------- hardening
+    def test_upstream_error_body_not_forwarded(self):
+        FakeArr.status = 500
+        FakeArr.body = b'{"message": "at Sonarr.Api.V3 in /app/sonarr/bin/Sonarr.dll"}'
+        resp, data = self.get_sonarr()
+        self.assertEqual(resp.status, 500)
+        self.assertNotIn(b"Sonarr.dll", data)
+        FakeArr.status = 404
+        resp, _ = self.get_sonarr()
+        self.assertEqual(resp.status, 404)
+
+    def test_upstream_auth_failure_and_redirect(self):
+        for status in (401, 403, 302):
+            FakeArr.status = status
+            resp, data = self.get_sonarr()
+            self.assertEqual(resp.status, 502, status)
+            self.assertIsNone(resp.getheader("Location"))
+            self.assertNotIn(b"internal-sonarr", data)
+
+    def test_unsafe_query_rejected(self):
+        h = {"X-Api-Key": SONARR_PROXY}
+        for q in ("?term=<script>", "?a=" + "x" * 3000, "?a=\"b\"", "?a=b'c"):
+            self.assertBlocked(400, "GET", "/sonarr/api/v3/series" + q, h)
+        resp, _ = self.req("GET", "/sonarr/api/v3/series/lookup?term=tvdb:81189&x=a%20b", h)
+        self.assertEqual(resp.status, 200)
+
+    def test_duplicate_key_headers_all_checked(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=5)
+        conn.putrequest("GET", "/sonarr/api/v3/series")
+        conn.putheader("X-Api-Key", SONARR_PROXY)
+        conn.putheader("X-Api-Key", "wrong")
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 401)
+        self.assertEqual(FakeArr.requests, [])
+
+    def test_log_path_escaped(self):
+        self.assertEqual(arrmor._UNPRINTABLE.sub("?", "/a\x1b[31m\nb"), "/a?[31m?b")
+
     def test_healthz(self):
         resp, data = self.req("GET", "/healthz")
         self.assertEqual((resp.status, data), (200, b"ok\n"))
@@ -293,6 +340,37 @@ class ClientAllowListTest(unittest.TestCase):
     def test_allowed_client_passes(self):
         port = self.start("127.0.0.1")
         self.assertEqual(self.req(port, "GET", "/sonarr/api/v3/series"), 200)
+
+    def test_foreign_ip_dropped_at_connect(self):
+        cfg = arrmor.load_config({**ConfigTest.base, "ARRMOR_HOST": "127.0.0.1", "ARRMOR_PORT": "0",
+                                  "ARRMOR_ALLOWED_CLIENTS": "10.0.0.0/8"})
+        srv = arrmor.make_server(cfg)
+        self.addCleanup(srv.server_close)
+        self.assertFalse(srv.verify_request(None, ("192.168.1.9", 1234)))
+        self.assertTrue(srv.verify_request(None, ("10.1.2.3", 1234)))
+        self.assertTrue(srv.verify_request(None, ("127.0.0.1", 1234)))  # local healthcheck
+
+    def test_connection_limit(self):
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeArr)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        cfg = arrmor.load_config({
+            "ARRMOR_HOST": "127.0.0.1", "ARRMOR_PORT": "0", "ARRMOR_MAX_CONNECTIONS": "1",
+            "ARRMOR_SONARR_URL": f"http://127.0.0.1:{upstream.server_port}",
+            "ARRMOR_SONARR_API_KEY": SONARR_KEY, "ARRMOR_SONARR_PROXY_KEY": SONARR_PROXY,
+        })
+        proxy = arrmor.make_server(cfg)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        for srv in (upstream, proxy):
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+        idle = socket.create_connection(("127.0.0.1", proxy.server_port))  # occupies the only slot
+        self.addCleanup(idle.close)
+        time.sleep(0.2)
+        with self.assertRaises((http.client.HTTPException, OSError)):
+            self.req(proxy.server_port, "GET", "/sonarr/api/v3/series")
+        idle.close()
+        time.sleep(0.2)
+        self.assertEqual(self.req(proxy.server_port, "GET", "/sonarr/api/v3/series"), 200)
 
     def test_ipv4_mapped_ipv6(self):
         cfg = arrmor.load_config({**ConfigTest.base, "ARRMOR_ALLOWED_CLIENTS": "192.168.1.0/24"})
@@ -454,6 +532,10 @@ class ConfigTest(unittest.TestCase):
             {**self.base, "ARRMOR_SONARR_URL": "http://u:p@x"},
             {**self.base, "ARRMOR_SONARR_EXTRA_ALLOW": "(["},
             {**self.base, "ARRMOR_ALLOWED_CLIENTS": "not-an-ip"},
+            {**self.base, "ARRMOR_MAX_CONNECTIONS": "0"},
+            {**self.base, "ARRMOR_MAX_UPSTREAM": "-1"},
+            {**self.base, "ARRMOR_TIMEOUT": "0"},
+            {**self.base, "ARRMOR_MAX_RESPONSE_MB": "abc"},
             {"ARRMOR_FOO_URL": "http://x", "ARRMOR_FOO_API_KEY": "a", "ARRMOR_FOO_PROXY_KEY": SONARR_PROXY},
             {**self.base, "ARRMOR_RADARR_URL": "http://r", "ARRMOR_RADARR_API_KEY": "x",
              "ARRMOR_RADARR_PROXY_KEY": SONARR_PROXY},
