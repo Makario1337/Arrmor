@@ -250,6 +250,63 @@ class ArrmorTest(unittest.TestCase):
         self.assertEqual(resp.status, 401)
         self.assertEqual(FakeArr.requests, [])
 
+    # ------------------------------------------------------------- RefreshMonitoredDownloads stub
+    def post_command(self, body, key=RADARR_PROXY, path="/radarr/api/v3/command"):
+        h = {"Content-Type": "application/json"}
+        if key:
+            h["X-Api-Key"] = key
+        return self.req("POST", path, h, body=body)
+
+    def test_refresh_downloads_answered_locally(self):
+        for path in ("/radarr/api/v3/command", "/radarr/api/v3/Command"):
+            resp, data = self.post_command(b'{"name":"RefreshMonitoredDownloads"}', path=path)
+            self.assertEqual(resp.status, 201)
+            self.assertEqual(json.loads(data)["name"], "RefreshMonitoredDownloads")
+        resp, _ = self.post_command(b'{"name":"RefreshMonitoredDownloads"}', key=SONARR_PROXY,
+                                    path="/sonarr/api/v3/command")
+        self.assertEqual(resp.status, 201)
+        self.assertEqual(FakeArr.requests, [])  # never forwarded
+
+    def test_refresh_downloads_keep_alive(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=5)
+        for _ in range(2):  # Seerr then reads the queue on the same connection
+            conn.request("POST", "/radarr/api/v3/command", body=b'{"name":"RefreshMonitoredDownloads"}',
+                         headers={"X-Api-Key": RADARR_PROXY})
+            r = conn.getresponse()
+            r.read()
+            self.assertEqual(r.status, 201)
+        conn.request("GET", "/radarr/api/v3/queue", headers={"X-Api-Key": RADARR_PROXY})
+        r = conn.getresponse()
+        r.read()
+        conn.close()
+        self.assertEqual(r.status, 200)
+
+    def test_other_commands_and_bodies_denied(self):
+        cases = [
+            (b'{"name":"MoviesSearch","movieIds":[1]}', RADARR_PROXY, "/radarr/api/v3/command", 405),
+            (b'{"name":"RefreshMonitoredDownloads","x":1}', RADARR_PROXY, "/radarr/api/v3/command", 405),
+            (b'["RefreshMonitoredDownloads"]', RADARR_PROXY, "/radarr/api/v3/command", 405),
+            (b'not json', RADARR_PROXY, "/radarr/api/v3/command", 405),
+            (b'{"name":"RefreshMonitoredDownloads"}' + b" " * 2000, RADARR_PROXY, "/radarr/api/v3/command", 405),
+            (b'{"name":"RefreshMonitoredDownloads"}', None, "/radarr/api/v3/command", 401),
+            (b'{"name":"RefreshMonitoredDownloads"}', SONARR_PROXY, "/radarr/api/v3/command", 401),
+            (b'{"name":"RefreshMonitoredDownloads"}', RADARR_PROXY, "/radarr/api/v3/movie", 405),
+            (b'{"name":"RefreshMonitoredDownloads"}', RADARR_PROXY, "/radarr/api/v3/command/1", 405),
+            (b'{"name":"RefreshMonitoredDownloads"}', RADARR_PROXY, "/radarr/api/v3/x/../command", 405),
+            (b'{"name":"RefreshMonitoredDownloads"}', RADARR_PROXY, "/radarr/x/../api/v3/command", 400),
+        ]
+        for body, key, path, status in cases:
+            resp, _ = self.post_command(body, key=key, path=path)
+            self.assertEqual(resp.status, status, (body[:50], path))
+        self.assertEqual(FakeArr.requests, [])
+
+    def test_refresh_stub_can_be_disabled(self):
+        cfg = self.proxy.RequestHandlerClass.config
+        cfg.stub_refresh = False
+        self.addCleanup(setattr, cfg, "stub_refresh", True)
+        resp, _ = self.post_command(b'{"name":"RefreshMonitoredDownloads"}')
+        self.assertEqual(resp.status, 405)
+
     def test_log_path_escaped(self):
         self.assertEqual(arrmor._UNPRINTABLE.sub("?", "/a\x1b[31m\nb"), "/a?[31m?b")
 
@@ -536,6 +593,7 @@ class ConfigTest(unittest.TestCase):
             {**self.base, "ARRMOR_MAX_UPSTREAM": "-1"},
             {**self.base, "ARRMOR_TIMEOUT": "0"},
             {**self.base, "ARRMOR_MAX_RESPONSE_MB": "abc"},
+            {**self.base, "ARRMOR_STUB_REFRESH_DOWNLOADS": "maybe"},
             {"ARRMOR_FOO_URL": "http://x", "ARRMOR_FOO_API_KEY": "a", "ARRMOR_FOO_PROXY_KEY": SONARR_PROXY},
             {**self.base, "ARRMOR_RADARR_URL": "http://r", "ARRMOR_RADARR_API_KEY": "x",
              "ARRMOR_RADARR_PROXY_KEY": SONARR_PROXY},

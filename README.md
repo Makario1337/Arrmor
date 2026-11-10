@@ -14,6 +14,7 @@ Arrmor runs next to Sonarr/Radarr. The only thing the DMZ can reach is Arrmor's 
 ## What it does
 
 - **Read-only.** `POST`, `PUT`, `PATCH`, `DELETE` and everything else are rejected (`405`). Seerr can show what is in the library, but cannot add, request, search, change or delete anything.
+  - One exception, answered by Arrmor itself and **never forwarded**: Seerr's *Download Sync* job sends the command `RefreshMonitoredDownloads` every minute and skips reading the download queue if that fails. Arrmor replies `201` to exactly `{"name": "RefreshMonitoredDownloads"}` (valid proxy key required), so download progress keeps working. Sonarr/Radarr run this refresh on their own every minute anyway. Disable with `ARRMOR_STUB_REFRESH_DOWNLOADS=false`.
 - **Allow-list, not just "GET only".** Sonarr/Radarr also expose secrets via GET (`/api/v3/config/host` contains the API key, `/api/v3/indexer` and `/api/v3/downloadclient` contain credentials, `/api/v3/system/backup` …). Arrmor only forwards these paths:
 
   | Sonarr | Radarr |
@@ -69,6 +70,7 @@ Each instance is defined by a group of environment variables. `<NAME>` is upperc
 | `ARRMOR_MAX_RESPONSE_MB` | no | Maximum upstream response size, default `64` (a library with thousands of titles needs a few MB) |
 | `ARRMOR_MAX_CONNECTIONS` | no | Maximum simultaneous client connections, default `32` |
 | `ARRMOR_MAX_UPSTREAM` | no | Maximum parallel requests to Sonarr/Radarr, default `4` |
+| `ARRMOR_STUB_REFRESH_DOWNLOADS` | no | Answer Seerr's `RefreshMonitoredDownloads` command locally, default `true` (see above) |
 | `ARRMOR_LOG_LEVEL` | no | `DEBUG`, `INFO` (default), `WARNING` |
 
 Generate a proxy key with `openssl rand -hex 32`.
@@ -77,7 +79,7 @@ Multiple instances (e.g. a 4K Sonarr) are just another group: `ARRMOR_SONARR4K_U
 
 ## Usage
 
-Image tags: `latest` = newest release, `1` / `1.0` / `1.0.0` = pinned release, `edge` = current `main`. Images are built for `amd64`, `arm64` and `armv7`.
+Image tags: `latest` = newest release, `1` / `1.1` / `1.1.0` = pinned release, `edge` = current `main`. Images are built for `amd64`, `arm64` and `armv7`.
 
 ```sh
 docker run -d --name arrmor --read-only \
@@ -126,6 +128,7 @@ Watch `docker logs -f arrmor` while clicking **Test**:
 | `GET / -> 404 (unknown prefix)` | URL Base empty or wrong (or path put into the hostname field) |
 | `-> 401 (bad or missing key …)` | Wrong API key — use the proxy key of *this* instance |
 | `-> 403 (client IP not allowed)` | `ARRMOR_ALLOWED_CLIENTS` doesn't contain the IP Seerr connects from (the log shows that IP) |
+| `POST …/api/v3/command -> 405 (write method)` every minute | Arrmor older than 1.1.0, or `ARRMOR_STUB_REFRESH_DOWNLOADS=false` — download progress in Seerr won't work |
 | `-> 403 (not on … allow-list)` | Seerr needs an endpoint Arrmor doesn't allow yet — please open an issue with the log line |
 | `upstream … unreachable` | Arrmor can't reach Sonarr/Radarr: check `ARRMOR_<NAME>_URL` |
 | `… rejected Arrmor's API key` | The real key in `ARRMOR_<NAME>_API_KEY` is wrong |

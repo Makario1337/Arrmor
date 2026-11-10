@@ -31,7 +31,7 @@ import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 log = logging.getLogger("arrmor")
 
@@ -81,6 +81,14 @@ RESPONSE_HEADERS = (
     "Last-Modified",
     "Vary",
 )
+
+# The only write Seerr makes that Arrmor answers itself (never forwarded):
+# Seerr's "Download Sync" job sends this command before reading the queue
+# and skips the queue if it fails. Sonarr/Radarr run it on their own every
+# minute anyway.
+STUB_COMMAND_PATH = re.compile(r"/api/v3/command", re.IGNORECASE)
+STUB_COMMANDS = {"refreshmonitoreddownloads"}
+MAX_COMMAND_BODY = 1024
 
 # JSON fields whose values are redacted in every response (compared
 # case-insensitively, ignoring "_" and "-"). Also applies to the *arr
@@ -259,6 +267,7 @@ class Config:
     max_response: int = 64 * 1024 * 1024
     max_connections: int = 32
     max_upstream: int = 4
+    stub_refresh: bool = True
 
     @property
     def secrets(self) -> list[str]:
@@ -370,6 +379,11 @@ def load_config(env: dict[str, str]) -> Config:
             except ValueError:
                 raise ConfigError(f"ARRMOR_ALLOWED_CLIENTS: invalid IP or CIDR {entry!r}")
 
+    stub = env.get("ARRMOR_STUB_REFRESH_DOWNLOADS", "true").strip().lower()
+    if stub not in ("true", "1", "yes", "false", "0", "no"):
+        raise ConfigError("ARRMOR_STUB_REFRESH_DOWNLOADS must be true or false")
+    stub_refresh = stub in ("true", "1", "yes")
+
     tls = None
     tls_cert = None
     cert = env.get("ARRMOR_TLS_CERT", "").strip()
@@ -407,6 +421,7 @@ def load_config(env: dict[str, str]) -> Config:
         max_response=max_response,
         max_connections=max_connections,
         max_upstream=max_upstream,
+        stub_refresh=stub_refresh,
     )
 
 
@@ -455,7 +470,49 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(403, "forbidden", reason="client IP not allowed")
         self._reply(405, "method not allowed", reason="write method")
 
-    do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = _deny_method
+    do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = _deny_method
+
+    def do_POST(self) -> None:
+        raw_path, _, raw_query = self.path.partition("?")
+        if not (self.config.stub_refresh and raw_path.lower().endswith("/api/v3/command")):
+            return self._deny_method()
+        self.close_connection = True  # until the body has been read
+        if not self.config.client_allowed(self.client_address[0]):
+            return self._reply(403, "forbidden", reason="client IP not allowed")
+        resolved = self._resolve(raw_path, raw_query)
+        if resolved is None:
+            return
+        inst, sub_path, _ = resolved
+        if not STUB_COMMAND_PATH.fullmatch(sub_path):
+            return self._reply(405, "method not allowed", reason="write method")
+
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = -1
+        if "Transfer-Encoding" in self.headers or not 0 < length <= MAX_COMMAND_BODY:
+            return self._reply(405, "method not allowed", reason="write method (command body)")
+        body = self.rfile.read(length)
+        self.close_connection = False
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = None
+        name = data.get("name") if isinstance(data, dict) else None
+        if not (isinstance(name, str) and set(data) == {"name"} and name.lower() in STUB_COMMANDS):
+            shown = _UNPRINTABLE.sub("?", name[:40]) if isinstance(name, str) else "?"
+            return self._reply(405, "method not allowed", reason=f"write method (command {shown})")
+
+        # Answered locally - nothing is sent to Sonarr/Radarr.
+        reply = json.dumps({"name": name, "status": "completed",
+                            "message": "answered by Arrmor, not forwarded"}).encode()
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+        log.debug("%s POST %s%s -> 201 (%s answered locally)",
+                  self.client_address[0], inst.prefix, sub_path, name)
 
     # ---------------------------------------------------------------- core
     def _handle(self) -> None:
@@ -482,6 +539,18 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return self._reply(400, "request body not allowed", reason="body on GET")
 
+        resolved = self._resolve(raw_path, raw_query)
+        if resolved is None:
+            return
+        inst, sub_path, kept = resolved
+        if not inst.allowed(sub_path):
+            return self._reply(403, "endpoint not allowed", reason=f"not on {inst.kind} allow-list")
+
+        self._forward(inst, sub_path, "&".join(kept))
+
+    def _resolve(self, raw_path: str, raw_query: str) -> tuple[Instance, str, list[str]] | None:
+        """Validate path/query, find the instance and check the proxy key.
+        Replies with an error and returns None if anything is wrong."""
         if not SAFE_PATH.fullmatch(raw_path) or "//" in raw_path:
             return self._reply(400, "invalid path", reason="unsafe path")
         if len(raw_query) > MAX_QUERY or not SAFE_QUERY.fullmatch(raw_query):
@@ -510,11 +579,7 @@ class Handler(BaseHTTPRequestHandler):
         ):
             return self._reply(401, "unauthorized", reason=f"bad or missing key for {inst.name}")
 
-        sub_path = raw_path[len(inst.prefix):] or "/"
-        if not inst.allowed(sub_path):
-            return self._reply(403, "endpoint not allowed", reason=f"not on {inst.kind} allow-list")
-
-        self._forward(inst, sub_path, "&".join(kept))
+        return inst, raw_path[len(inst.prefix):] or "/", kept
 
     def _forward(self, inst: Instance, sub_path: str, query: str) -> None:
         target = inst.base_path + sub_path + (f"?{query}" if query else "")
