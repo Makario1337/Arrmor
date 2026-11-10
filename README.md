@@ -29,6 +29,10 @@ Arrmor runs next to Sonarr/Radarr. The only thing the DMZ can reach is Arrmor's 
   | `/api/v3/languageprofile` | |
 
   Anything else returns `403`. Paths with `..`, `%`-encoding, `//`, `;` etc. are rejected (`400`).
+- **Credential filter on every response.** Even the allowed endpoints are not trusted blindly:
+  - JSON fields that look like credentials (`apiKey`, `password`, `token`, `secret`, `passkey`, … — also in the *arr provider format `{"name": "apiKey", "value": …}`) are replaced with `********`.
+  - If a real Sonarr/Radarr API key still appears anywhere in a response (any field, any case, JSON or not), the response is not delivered at all (`502`) and an error is logged.
+  - For this, responses are fetched uncompressed and checked as a whole before they are sent (limit: `ARRMOR_MAX_RESPONSE_MB`).
 - **Separate keys.** Every instance has its own proxy key. Seerr only knows the proxy key; Arrmor swaps it for the real key. Proxy keys from the query string (`?apikey=`) are stripped before forwarding.
 - **Client IP allow-list.** With `ARRMOR_ALLOWED_CLIENTS` only the Seerr host may talk to Arrmor at all (`403` otherwise) — a second layer behind the firewall.
 - **Header hygiene.** Only a handful of request/response headers are passed through (no cookies, no `Location`, no `Server`).
@@ -47,10 +51,14 @@ Each instance is defined by a group of environment variables. `<NAME>` is upperc
 | `ARRMOR_<NAME>_TYPE` | no | `sonarr` or `radarr`; inferred if `<NAME>` starts with one of those |
 | `ARRMOR_<NAME>_EXTRA_ALLOW` | no | Comma-separated extra path regexes (GET only), use with care |
 | `ARRMOR_ALLOWED_CLIENTS` | no (recommended) | Comma-separated IPs/CIDRs allowed to connect, e.g. `192.168.50.10`. Empty = any client with a valid key |
-| `ARRMOR_TLS_CERT` / `ARRMOR_TLS_KEY` | no | Paths to certificate and key (PEM). If set, Arrmor serves HTTPS only, see [HTTPS](#https) |
+| `ARRMOR_TLS_CERT` / `ARRMOR_TLS_KEY` | no | Paths to your own certificate and key (PEM) → HTTPS only, see [HTTPS](#https) |
+| `ARRMOR_TLS_SELF_SIGNED` | no | `true` = generate and use a self-signed certificate, see [HTTPS](#https). Default `false` |
+| `ARRMOR_TLS_SAN` | with self-signed | Address(es) Seerr connects to, e.g. `IP:10.1.5.3,DNS:arrmor.lan` |
+| `ARRMOR_TLS_DIR` | no | Where the self-signed certificate is stored, default `/certs` |
 | `ARRMOR_PORT` | no | Listen port, default `8080` |
 | `ARRMOR_HOST` | no | Listen address, default `0.0.0.0` |
 | `ARRMOR_TIMEOUT` | no | Upstream timeout in seconds, default `60` |
+| `ARRMOR_MAX_RESPONSE_MB` | no | Maximum upstream response size, default `256` (large libraries need a few MB) |
 | `ARRMOR_LOG_LEVEL` | no | `DEBUG`, `INFO` (default), `WARNING` |
 
 Generate a proxy key with `openssl rand -hex 32`.
@@ -110,13 +118,36 @@ Watch `docker logs -f arrmor` while clicking **Test**:
 | `-> 403 (client IP not allowed)` | `ARRMOR_ALLOWED_CLIENTS` doesn't contain the IP Seerr connects from (the log shows that IP) |
 | `-> 403 (not on … allow-list)` | Seerr needs an endpoint Arrmor doesn't allow yet — please open an issue with the log line |
 | `upstream … unreachable` | Arrmor can't reach Sonarr/Radarr: check `ARRMOR_<NAME>_URL` |
+| `REDACTED n credential field(s) …` | Arrmor removed credential-like fields from a response. Harmless, but please report the endpoint |
+| `BLOCKED response … contains an API key` | A response contained a real API key and was dropped — please open an issue |
 | `GET /radarr/api/v3/system/status -> 200` | Connection works |
 
 ## HTTPS
 
-Optional, but recommended when the traffic between DMZ and LAN could be sniffed. A self-signed certificate is enough.
+Optional, but recommended when the traffic between DMZ and LAN could be sniffed. Arrmor then speaks HTTPS only (TLS 1.2+); plain HTTP requests fail. There are two ways — pick **one**:
 
-**1. Create a certificate on the arr server.** The IP (or DNS name) must be the address Seerr connects to:
+### Option A: Arrmor generates a self-signed certificate (easiest)
+
+```yaml
+  arrmor:
+    volumes:
+      - arrmor-certs:/certs          # keeps the certificate across restarts/updates
+    environment:
+      ARRMOR_TLS_SELF_SIGNED: "true"
+      ARRMOR_TLS_SAN: IP:10.1.5.3    # the address Seerr connects to
+volumes:
+  arrmor-certs:
+```
+
+- `ARRMOR_TLS_SAN` must contain the IP or DNS name you enter in Seerr's *Hostname* field, e.g. `IP:10.1.5.3` or `IP:10.1.5.3,DNS:arrmor.lan`. Otherwise Seerr rejects the certificate.
+- On first start Arrmor creates `arrmor.crt` / `arrmor.key` in `/certs` (ECDSA P-256, valid 10 years). Later starts reuse it; it is only regenerated when `ARRMOR_TLS_SAN` changes.
+- Without a volume the certificate is lost whenever the container is recreated, and Seerr has to be updated again. Use a named volume as above; for a bind mount (`./certs:/certs`) run `chown 65534:65534 certs` first, since Arrmor runs as uid 65534.
+- The certificate and its SHA-256 fingerprint are printed to the log on every start. Get the file with:
+  ```sh
+  docker cp arrmor:/certs/arrmor.crt .
+  ```
+
+### Option B: bring your own certificate
 
 ```sh
 mkdir certs
@@ -126,11 +157,8 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
 chown 65534:65534 certs/arrmor.key && chmod 400 certs/arrmor.key   # container runs as uid 65534
 ```
 
-For a DNS name use `subjectAltName=DNS:arrmor.lan` instead (or both: `IP:10.1.5.3,DNS:arrmor.lan`).
-
-**2. Enable it in Arrmor:**
-
 ```yaml
+  arrmor:
     volumes:
       - ./certs:/certs:ro
     environment:
@@ -138,9 +166,11 @@ For a DNS name use `subjectAltName=DNS:arrmor.lan` instead (or both: `IP:10.1.5.
       ARRMOR_TLS_KEY: /certs/arrmor.key
 ```
 
-Arrmor then speaks HTTPS only (TLS 1.2+); plain HTTP requests fail.
+This also works with a certificate from your own CA or Let's Encrypt (use the full chain).
 
-**3. Make Seerr trust the certificate.** Seerr is a Node.js app and rejects self-signed certificates by default. Copy **only `arrmor.crt`** (never the key) to the Seerr host and add it to Node's trust store:
+### Make Seerr trust the certificate
+
+Seerr is a Node.js app and **does not trust self-signed certificates** — neither one generated by Arrmor nor one you made yourself. Copy **only `arrmor.crt`** (never the key) to the Seerr host and add it to Node's trust store:
 
 ```yaml
   seerr:
@@ -150,7 +180,7 @@ Arrmor then speaks HTTPS only (TLS 1.2+); plain HTTP requests fail.
       NODE_EXTRA_CA_CERTS: /certs/arrmor.crt
 ```
 
-Recreate the Seerr container, then tick **Use SSL** in the Sonarr/Radarr settings.
+Recreate the Seerr container, then tick **Use SSL** in the Sonarr/Radarr settings. If Arrmor ever generates a new certificate (log: `generated NEW self-signed certificate`), copy it again and recreate Seerr.
 
 Do **not** use `NODE_TLS_REJECT_UNAUTHORIZED=0` instead — it disables certificate checks for *all* of Seerr's connections (TMDB, Plex, Jellyfin, …).
 

@@ -11,6 +11,7 @@ No third-party dependencies, Python >= 3.10.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import http.client
 import ipaddress
@@ -18,14 +19,17 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import ssl
+import subprocess
 import sys
 import urllib.parse
+import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 log = logging.getLogger("arrmor")
 
@@ -62,7 +66,9 @@ DEFAULT_ALLOW: dict[str, list[str]] = {
 }
 
 # Only these headers are passed from Seerr to the upstream ...
-REQUEST_HEADERS = ("Accept", "Accept-Encoding", "Accept-Language")
+# Accept-Encoding is not forwarded: responses must arrive uncompressed so
+# they can be checked for credentials.
+REQUEST_HEADERS = ("Accept", "Accept-Language")
 # ... and only these from the upstream back to Seerr.
 RESPONSE_HEADERS = (
     "Content-Type",
@@ -74,6 +80,16 @@ RESPONSE_HEADERS = (
     "Vary",
 )
 
+# JSON fields whose values are redacted in every response (compared
+# case-insensitively, ignoring "_" and "-"). Also applies to the *arr
+# provider format {"name": "apiKey", "value": "..."}.
+SENSITIVE_FIELDS = {
+    "apikey", "password", "passphrase", "passkey", "rsskey", "secret", "clientsecret",
+    "token", "accesstoken", "refreshtoken", "authtoken", "bearertoken", "apitoken",
+    "privatekey", "cookie", "cookies", "sessionid", "authorization", "credentials",
+}
+REDACTED = "********"
+
 # Query parameters carrying credentials are never forwarded.
 CREDENTIAL_PARAMS = {"apikey", "access_token"}
 
@@ -84,6 +100,42 @@ SAFE_PATH = re.compile(r"/[A-Za-z0-9_\-/]*")
 
 class ConfigError(Exception):
     pass
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _has_value(v) -> bool:
+    return v not in (None, "", [], {}) and not isinstance(v, bool)
+
+
+def redact(obj) -> int:
+    """Replace values of credential-like fields in a parsed JSON document
+    in place. Returns the number of redacted values."""
+    count = 0
+    if isinstance(obj, dict):
+        name = obj.get("name")
+        if (isinstance(name, str) and _norm(name) in SENSITIVE_FIELDS
+                and _has_value(obj.get("value"))):
+            obj["value"] = REDACTED
+            count += 1
+        for key, value in obj.items():
+            if _norm(key) in SENSITIVE_FIELDS and _has_value(value):
+                obj[key] = REDACTED
+                count += 1
+            else:
+                count += redact(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            count += redact(value)
+    return count
+
+
+def contains_secret(body: bytes, secrets: list[str]) -> bool:
+    """True if any of the secrets appears anywhere in body (case-insensitive)."""
+    lowered = body.lower()
+    return any(s and s.lower().encode() in lowered for s in secrets)
 
 
 @dataclass
@@ -103,6 +155,85 @@ class Instance:
         return any(p.fullmatch(path) for p in self.allow)
 
 
+def parse_san(value: str) -> str:
+    """Validate a subjectAltName list like 'IP:10.1.5.3,DNS:arrmor.lan'."""
+    entries = []
+    for entry in value.split(","):
+        kind, _, name = entry.strip().partition(":")
+        kind, name = kind.strip().upper(), name.strip()
+        if kind == "IP":
+            try:
+                name = str(ipaddress.ip_address(name))
+            except ValueError:
+                raise ConfigError(f"ARRMOR_TLS_SAN: invalid IP {name!r}")
+        elif kind == "DNS":
+            if not re.fullmatch(r"(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", name):
+                raise ConfigError(f"ARRMOR_TLS_SAN: invalid DNS name {name!r}")
+        else:
+            raise ConfigError(
+                f"ARRMOR_TLS_SAN: entries must look like IP:10.1.5.3 or DNS:arrmor.lan, got {entry.strip()!r}")
+        entries.append(f"{kind}:{name}")
+    return ",".join(entries)
+
+
+def ensure_self_signed(directory: str, san: str) -> tuple[str, str]:
+    """Create a self-signed certificate in `directory` unless a matching one exists.
+
+    The certificate is reused across restarts (so Seerr's trust stays valid)
+    and only regenerated when ARRMOR_TLS_SAN changes.
+    """
+    cert = os.path.join(directory, "arrmor.crt")
+    key = os.path.join(directory, "arrmor.key")
+    marker = os.path.join(directory, "arrmor.san")
+    try:
+        with open(marker) as f:
+            existing = f.read().strip()
+    except OSError:
+        existing = None
+    if existing == san and os.path.isfile(cert) and os.path.isfile(key):
+        log.info("using existing self-signed certificate %s (%s)", cert, san)
+        return cert, key
+
+    if not shutil.which("openssl"):
+        raise ConfigError("ARRMOR_TLS_SELF_SIGNED needs the openssl binary")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        tmp_cert, tmp_key = cert + ".tmp", key + ".tmp"
+        result = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+             "-sha256", "-days", "3650", "-nodes", "-subj", "/CN=arrmor",
+             "-addext", f"subjectAltName={san}",
+             "-addext", "basicConstraints=critical,CA:TRUE",
+             "-addext", "keyUsage=critical,digitalSignature,keyCertSign",
+             "-addext", "extendedKeyUsage=serverAuth",
+             "-keyout", tmp_key, "-out", tmp_cert],
+            capture_output=True, text=True, umask=0o077,
+        )
+        if result.returncode != 0:
+            raise ConfigError(f"openssl failed: {result.stderr.strip()}")
+        os.chmod(tmp_cert, 0o644)
+        os.replace(tmp_key, key)
+        os.replace(tmp_cert, cert)
+        with open(marker, "w") as f:
+            f.write(san + "\n")
+    except OSError as e:
+        raise ConfigError(f"cannot write self-signed certificate to {directory}: {e} "
+                          "(is the directory a writable volume owned by uid 65534?)")
+
+    log.warning("generated NEW self-signed certificate %s for %s - "
+                "Seerr has to trust this certificate (NODE_EXTRA_CA_CERTS), see README", cert, san)
+    return cert, key
+
+
+def log_certificate(cert_path: str) -> None:
+    with open(cert_path) as f:
+        pem = f.read()
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    fp = hashlib.sha256(der).hexdigest().upper()
+    log.info("TLS certificate SHA-256 fingerprint: %s", ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)))
+    log.info("TLS certificate (copy to the Seerr host as arrmor.crt):\n%s", pem.strip())
+
+
 @dataclass
 class Config:
     host: str
@@ -111,6 +242,14 @@ class Config:
     instances: list[Instance]
     allowed_clients: list = field(default_factory=list)  # empty = everyone
     tls: ssl.SSLContext | None = None  # None = plain HTTP
+    tls_cert: str | None = None  # set when self-signed, for logging
+    max_response: int = 256 * 1024 * 1024
+
+    @property
+    def secrets(self) -> list[str]:
+        # All real API keys. Very short values are ignored (would match
+        # everywhere); real Sonarr/Radarr keys have 32 characters.
+        return [i.api_key for i in self.instances if len(i.api_key) >= 8]
 
     def client_allowed(self, ip: str) -> bool:
         if not self.allowed_clients:
@@ -199,8 +338,9 @@ def load_config(env: dict[str, str]) -> Config:
     try:
         port = int(env.get("ARRMOR_PORT", "8080"))
         timeout = float(env.get("ARRMOR_TIMEOUT", "60"))
+        max_response = int(float(env.get("ARRMOR_MAX_RESPONSE_MB", "256")) * 1024 * 1024)
     except ValueError:
-        raise ConfigError("ARRMOR_PORT / ARRMOR_TIMEOUT must be numbers")
+        raise ConfigError("ARRMOR_PORT / ARRMOR_TIMEOUT / ARRMOR_MAX_RESPONSE_MB must be numbers")
 
     allowed_clients = []
     for entry in env.get("ARRMOR_ALLOWED_CLIENTS", "").split(","):
@@ -211,10 +351,23 @@ def load_config(env: dict[str, str]) -> Config:
                 raise ConfigError(f"ARRMOR_ALLOWED_CLIENTS: invalid IP or CIDR {entry!r}")
 
     tls = None
+    tls_cert = None
     cert = env.get("ARRMOR_TLS_CERT", "").strip()
     key = env.get("ARRMOR_TLS_KEY", "").strip()
+    self_signed = env.get("ARRMOR_TLS_SELF_SIGNED", "").strip().lower()
+    if self_signed not in ("", "false", "0", "no", "true", "1", "yes"):
+        raise ConfigError("ARRMOR_TLS_SELF_SIGNED must be true or false")
     if bool(cert) != bool(key):
         raise ConfigError("ARRMOR_TLS_CERT and ARRMOR_TLS_KEY must be set together")
+    if self_signed in ("true", "1", "yes"):
+        if cert:
+            raise ConfigError("use either ARRMOR_TLS_SELF_SIGNED or ARRMOR_TLS_CERT/ARRMOR_TLS_KEY, not both")
+        san = env.get("ARRMOR_TLS_SAN", "").strip()
+        if not san:
+            raise ConfigError("ARRMOR_TLS_SELF_SIGNED needs ARRMOR_TLS_SAN, the address Seerr connects to, "
+                              "e.g. IP:10.1.5.3 or DNS:arrmor.lan")
+        cert, key = ensure_self_signed(env.get("ARRMOR_TLS_DIR", "/certs"), parse_san(san))
+        tls_cert = cert
     if cert:
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -230,6 +383,8 @@ def load_config(env: dict[str, str]) -> Config:
         instances=instances,
         allowed_clients=allowed_clients,
         tls=tls,
+        tls_cert=tls_cert,
+        max_response=max_response,
     )
 
 
@@ -342,6 +497,7 @@ class Handler(BaseHTTPRequestHandler):
         headers = {h: v for h in REQUEST_HEADERS if (v := self.headers.get(h))}
         headers["X-Api-Key"] = inst.api_key
         headers["User-Agent"] = f"Arrmor/{VERSION}"
+        headers["Accept-Encoding"] = "identity"
 
         if inst.scheme == "https":
             conn = http.client.HTTPSConnection(
@@ -351,39 +507,71 @@ class Handler(BaseHTTPRequestHandler):
             conn = http.client.HTTPConnection(inst.host, inst.port, timeout=self.config.timeout)
 
         try:
-            conn.request(self.command, target, headers=headers)
-            resp = conn.getresponse()
-        except (OSError, http.client.HTTPException) as e:
+            try:
+                conn.request(self.command, target, headers=headers)
+                resp = conn.getresponse()
+                body = b"" if self.command == "HEAD" else resp.read(self.config.max_response + 1)
+            except (OSError, http.client.HTTPException) as e:
+                log.error("upstream %s unreachable: %s", inst.name, e)
+                return self._reply(502, "upstream unreachable")
+        finally:
             conn.close()
-            log.error("upstream %s unreachable: %s", inst.name, e)
-            return self._reply(502, "upstream unreachable")
+
+        logged_path = inst.prefix + sub_path
+        if len(body) > self.config.max_response:
+            log.error("response from %s for %s exceeds ARRMOR_MAX_RESPONSE_MB", inst.name, logged_path)
+            return self._reply(502, "upstream response too large")
+
+        encoding = (resp.getheader("Content-Encoding") or "identity").lower().strip()
+        if encoding in ("gzip", "deflate") and body:
+            try:
+                d = zlib.decompressobj(zlib.MAX_WBITS | 32)  # gzip or zlib header
+                body = d.decompress(body, self.config.max_response + 1)
+            except zlib.error as e:
+                log.error("cannot decompress response from %s: %s", inst.name, e)
+                return self._reply(502, "invalid upstream response")
+            if len(body) > self.config.max_response or d.unconsumed_tail:
+                return self._reply(502, "upstream response too large")
+        elif encoding != "identity":
+            log.error("unsupported Content-Encoding %r from %s", encoding, inst.name)
+            return self._reply(502, "invalid upstream response")
+
+        # Layer 2: redact credential-like JSON fields.
+        if body and "json" in (resp.getheader("Content-Type") or "").lower():
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            if data is not None and (n := redact(data)):
+                body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+                log.warning("REDACTED %d credential field(s) in response %s %s",
+                            n, self.command, logged_path)
+
+        # Layer 3: never deliver a response that contains a real API key.
+        if contains_secret(body, self.config.secrets):
+            log.error("BLOCKED response %s %s: contains an API key", self.command, logged_path)
+            return self._reply(502, "response blocked")
 
         try:
             self.send_response(resp.status)
             for name in RESPONSE_HEADERS:
-                if name == "Content-Length":
+                if name in ("Content-Length", "Content-Encoding"):
                     continue
                 if (value := resp.getheader(name)) is not None:
                     self.send_header(name, value)
-            length = resp.getheader("Content-Length")
-            if length is not None and resp.getheader("Transfer-Encoding") is None:
-                self.send_header("Content-Length", length)
-            elif self.command != "HEAD":
-                # Unknown length: stream until EOF, then close the connection.
-                self.send_header("Connection", "close")
-                self.close_connection = True
+            if self.command == "HEAD":
+                if (length := resp.getheader("Content-Length")) is not None:
+                    self.send_header("Content-Length", length)
+            else:
+                self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-
             if self.command != "HEAD":
-                while chunk := resp.read(65536):
-                    self.wfile.write(chunk)
-            log.info("%s %s %s -> %d", self.client_address[0], self.command,
-                     inst.prefix + sub_path, resp.status)
-        except (OSError, http.client.HTTPException) as e:
+                self.wfile.write(body)
+        except OSError as e:
             self.close_connection = True
-            log.error("error while relaying response from %s: %s", inst.name, e)
-        finally:
-            conn.close()
+            log.error("error while sending response for %s: %s", logged_path, e)
+            return
+        log.info("%s %s %s -> %d", self.client_address[0], self.command, logged_path, resp.status)
 
 
 class Server(ThreadingHTTPServer):
@@ -417,7 +605,8 @@ def make_server(config: Config) -> ThreadingHTTPServer:
 def healthcheck() -> int:
     port = int(os.environ.get("ARRMOR_PORT", "8080"))
     try:
-        if os.environ.get("ARRMOR_TLS_CERT"):
+        if os.environ.get("ARRMOR_TLS_CERT") or os.environ.get(
+                "ARRMOR_TLS_SELF_SIGNED", "").strip().lower() in ("true", "1", "yes"):
             # Local check only - the certificate is issued for the public address.
             ctx = ssl._create_unverified_context()
             conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=ctx)
@@ -450,6 +639,8 @@ def main() -> int:
 
     log.info("Arrmor %s listening on %s://%s:%d", VERSION,
              "https" if config.tls else "http", config.host, config.port)
+    if config.tls_cert:
+        log_certificate(config.tls_cert)
     if config.allowed_clients:
         log.info("  allowed clients: %s", ", ".join(map(str, config.allowed_clients)))
     else:

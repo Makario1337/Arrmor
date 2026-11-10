@@ -9,6 +9,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ARRMOR_PORT=8080
 
+# openssl is only used for ARRMOR_TLS_SELF_SIGNED; /certs is where the
+# generated certificate lives (mount a volume there to keep it).
+RUN apk add --no-cache openssl \
+ && mkdir /certs \
+ && chown 65534:65534 /certs
+
 COPY arrmor.py /app/arrmor.py
 
 USER 65534:65534

@@ -1,4 +1,5 @@
 import http.client
+import gzip
 import json
 import os
 import shutil
@@ -25,15 +26,21 @@ class FakeArr(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     requests: list = []
     chunked = False
+    body = None  # override response body (bytes)
+    content_type = "application/json"
+    gzip = False
 
     def log_message(self, *a):
         pass
 
     def _any(self):
         FakeArr.requests.append((self.command, self.path, dict(self.headers)))
-        body = json.dumps({"path": self.path}).encode()
+        body = FakeArr.body if FakeArr.body is not None else json.dumps({"path": self.path}).encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", FakeArr.content_type)
+        if FakeArr.gzip:
+            body = gzip.compress(body)
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Set-Cookie", "secret=1")
         self.send_header("Server", "Kestrel")
         if FakeArr.chunked:
@@ -78,6 +85,9 @@ class ArrmorTest(unittest.TestCase):
     def setUp(self):
         FakeArr.requests.clear()
         FakeArr.chunked = False
+        FakeArr.body = None
+        FakeArr.content_type = "application/json"
+        FakeArr.gzip = False
 
     def req(self, method, path, headers=None, body=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=5)
@@ -127,6 +137,74 @@ class ArrmorTest(unittest.TestCase):
         resp, data = self.req("GET", "/sonarr/api/v3/series", {"X-Api-Key": SONARR_PROXY})
         self.assertEqual(resp.status, 200)
         self.assertEqual(json.loads(data)["path"], "/sonarr-base/api/v3/series")
+
+    # ------------------------------------------------------------- credential filter
+    def get_sonarr(self, path="/sonarr/api/v3/series"):
+        return self.req("GET", path, {"X-Api-Key": SONARR_PROXY})
+
+    def test_upstream_never_compresses(self):
+        self.req("GET", "/sonarr/api/v3/series", {"X-Api-Key": SONARR_PROXY, "Accept-Encoding": "gzip"})
+        self.assertEqual(FakeArr.requests[0][2]["Accept-Encoding"], "identity")
+
+    def test_normal_response_unchanged(self):
+        FakeArr.body = b'[ {"title": "Breaking Bad", "tvdbId": 81189, "ratings": {"value": 9.5}} ]'
+        resp, data = self.get_sonarr()
+        self.assertEqual((resp.status, data), (200, FakeArr.body))
+
+    def test_credential_fields_redacted(self):
+        FakeArr.body = json.dumps({
+            "title": "ok",
+            "apiKey": "abc123",
+            "nested": [{"Password": "hunter2", "user_name": "bob"}],
+            "fields": [{"name": "apiKey", "value": "zzz"}, {"name": "baseUrl", "value": "/x"}],
+            "token": None,
+            "authentication": "forms",
+        }).encode()
+        resp, data = self.get_sonarr()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(int(resp.getheader("Content-Length")), len(data))
+        doc = json.loads(data)
+        self.assertEqual(doc["apiKey"], "********")
+        self.assertEqual(doc["nested"][0], {"Password": "********", "user_name": "bob"})
+        self.assertEqual(doc["fields"][0]["value"], "********")
+        self.assertEqual(doc["fields"][1]["value"], "/x")
+        self.assertIsNone(doc["token"])
+        self.assertEqual(doc["authentication"], "forms")
+        for secret in (b"abc123", b"hunter2", b"zzz"):
+            self.assertNotIn(secret, data)
+
+    def test_real_api_key_anywhere_blocks_response(self):
+        cases = [
+            json.dumps({"comment": f"key is {SONARR_KEY}"}).encode(),       # own key, odd field
+            json.dumps({"x": RADARR_KEY}).encode(),                         # other instance's key
+            json.dumps({"x": SONARR_KEY.upper()}).encode(),                 # different case
+            f"<html>{SONARR_KEY}</html>".encode(),                          # non-JSON
+        ]
+        for body in cases:
+            FakeArr.body = body
+            resp, data = self.get_sonarr()
+            self.assertEqual(resp.status, 502, body)
+            self.assertNotIn(SONARR_KEY.encode(), data.lower())
+            self.assertNotIn(RADARR_KEY.encode(), data.lower())
+
+    def test_gzip_upstream_is_checked(self):
+        FakeArr.gzip = True
+        FakeArr.body = json.dumps({"apiKey": SONARR_KEY}).encode()
+        resp, data = self.get_sonarr()
+        self.assertEqual(resp.status, 200)  # redacted, so no key left
+        self.assertEqual(json.loads(data), {"apiKey": "********"})
+        self.assertIsNone(resp.getheader("Content-Encoding"))
+        FakeArr.body = json.dumps({"other": SONARR_KEY}).encode()
+        resp, _ = self.get_sonarr()
+        self.assertEqual(resp.status, 502)
+
+    def test_response_size_limit(self):
+        cfg = self.proxy.RequestHandlerClass.config
+        old, cfg.max_response = cfg.max_response, 100
+        self.addCleanup(setattr, cfg, "max_response", old)
+        FakeArr.body = b"[" + b"1," * 100 + b"1]"
+        resp, _ = self.get_sonarr()
+        self.assertEqual(resp.status, 502)
 
     def test_healthz(self):
         resp, data = self.req("GET", "/healthz")
@@ -286,6 +364,66 @@ class TlsTest(unittest.TestCase):
                     {**base, "ARRMOR_TLS_CERT": "/nope.crt", "ARRMOR_TLS_KEY": "/nope.key"}):
             with self.assertRaises(arrmor.ConfigError):
                 arrmor.load_config(env)
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl CLI not available")
+class SelfSignedTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = os.path.join(self.tmp.name, "certs")
+        self.env = {**ConfigTest.base, "ARRMOR_HOST": "127.0.0.1", "ARRMOR_PORT": "0",
+                    "ARRMOR_TLS_SELF_SIGNED": "true", "ARRMOR_TLS_DIR": self.dir,
+                    "ARRMOR_TLS_SAN": "IP:127.0.0.1, DNS:arrmor.lan"}
+
+    def read(self, name):
+        with open(os.path.join(self.dir, name), "rb") as f:
+            return f.read()
+
+    def test_generates_reuses_and_regenerates(self):
+        cfg = arrmor.load_config(self.env)
+        self.assertIsNotNone(cfg.tls)
+        first = self.read("arrmor.crt")
+        self.assertEqual(os.stat(os.path.join(self.dir, "arrmor.key")).st_mode & 0o777, 0o600)
+        # restart: same certificate
+        arrmor.load_config(self.env)
+        self.assertEqual(self.read("arrmor.crt"), first)
+        # SAN changed: new certificate
+        arrmor.load_config({**self.env, "ARRMOR_TLS_SAN": "IP:127.0.0.2"})
+        self.assertNotEqual(self.read("arrmor.crt"), first)
+
+    def test_client_trusting_generated_cert(self):
+        cfg = arrmor.load_config(self.env)
+        proxy = arrmor.make_server(cfg)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
+        cert = os.path.join(self.dir, "arrmor.crt")
+        ctx = ssl.create_default_context(cafile=cert)
+        conn = http.client.HTTPSConnection("127.0.0.1", proxy.server_port, context=ctx, timeout=5)
+        conn.request("GET", "/healthz")
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+        if shutil.which("node"):  # what Seerr does with NODE_EXTRA_CA_CERTS
+            out = subprocess.run(
+                ["node", "-e", f"require('https').get('https://127.0.0.1:{proxy.server_port}/healthz',"
+                 "r=>{console.log(r.statusCode);process.exit(0)}).on('error',e=>{console.log(e.code);process.exit(0)})"],
+                env={**os.environ, "NODE_EXTRA_CA_CERTS": cert}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(out.stdout.strip(), "200")
+
+    def test_errors(self):
+        for env in ({**self.env, "ARRMOR_TLS_SAN": ""},
+                    {**self.env, "ARRMOR_TLS_SAN": "10.1.5.3"},
+                    {**self.env, "ARRMOR_TLS_SAN": "IP:999.1.1.1"},
+                    {**self.env, "ARRMOR_TLS_SAN": "DNS:bad name"},
+                    {**self.env, "ARRMOR_TLS_SELF_SIGNED": "maybe"},
+                    {**self.env, "ARRMOR_TLS_CERT": "/x.crt", "ARRMOR_TLS_KEY": "/x.key"}):
+            with self.assertRaises(arrmor.ConfigError, msg=str(env)):
+                arrmor.load_config(env)
+
+    def test_disabled_by_default(self):
+        self.assertIsNone(arrmor.load_config(ConfigTest.base).tls)
+        self.assertIsNone(arrmor.load_config({**ConfigTest.base, "ARRMOR_TLS_SELF_SIGNED": "false"}).tls)
 
 
 class ConfigTest(unittest.TestCase):
