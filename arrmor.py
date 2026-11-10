@@ -25,7 +25,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 log = logging.getLogger("arrmor")
 
@@ -110,6 +110,7 @@ class Config:
     timeout: float
     instances: list[Instance]
     allowed_clients: list = field(default_factory=list)  # empty = everyone
+    tls: ssl.SSLContext | None = None  # None = plain HTTP
 
     def client_allowed(self, ip: str) -> bool:
         if not self.allowed_clients:
@@ -209,12 +210,26 @@ def load_config(env: dict[str, str]) -> Config:
             except ValueError:
                 raise ConfigError(f"ARRMOR_ALLOWED_CLIENTS: invalid IP or CIDR {entry!r}")
 
+    tls = None
+    cert = env.get("ARRMOR_TLS_CERT", "").strip()
+    key = env.get("ARRMOR_TLS_KEY", "").strip()
+    if bool(cert) != bool(key):
+        raise ConfigError("ARRMOR_TLS_CERT and ARRMOR_TLS_KEY must be set together")
+    if cert:
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            tls.load_cert_chain(cert, key)
+        except (OSError, ssl.SSLError) as e:
+            raise ConfigError(f"cannot load TLS certificate/key: {e}")
+
     return Config(
         host=env.get("ARRMOR_HOST", "0.0.0.0"),
         port=port,
         timeout=timeout,
         instances=instances,
         allowed_clients=allowed_clients,
+        tls=tls,
     )
 
 
@@ -373,10 +388,20 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    tls: ssl.SSLContext | None = None
+
+    def finish_request(self, request, client_address) -> None:
+        # Runs in the per-connection thread, so a slow TLS handshake never
+        # blocks accepting other connections.
+        if self.tls is not None:
+            request.settimeout(30)
+            request = self.tls.wrap_socket(request, server_side=True)
+            request.settimeout(None)
+        super().finish_request(request, client_address)
 
     def handle_error(self, request, client_address) -> None:
         exc = sys.exc_info()[1]
-        if isinstance(exc, (ConnectionError, TimeoutError)):
+        if isinstance(exc, (ConnectionError, TimeoutError, ssl.SSLError)):
             log.debug("client %s disconnected: %s", client_address[0], exc)
         else:
             log.exception("unhandled error for client %s", client_address[0])
@@ -384,13 +409,20 @@ class Server(ThreadingHTTPServer):
 
 def make_server(config: Config) -> ThreadingHTTPServer:
     handler = type("ConfiguredHandler", (Handler,), {"config": config})
-    return Server((config.host, config.port), handler)
+    server = Server((config.host, config.port), handler)
+    server.tls = config.tls
+    return server
 
 
 def healthcheck() -> int:
     port = int(os.environ.get("ARRMOR_PORT", "8080"))
     try:
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        if os.environ.get("ARRMOR_TLS_CERT"):
+            # Local check only - the certificate is issued for the public address.
+            ctx = ssl._create_unverified_context()
+            conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=ctx)
+        else:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request("GET", "/healthz")
         ok = conn.getresponse().status == 200
         conn.close()
@@ -416,7 +448,8 @@ def main() -> int:
     server = make_server(config)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    log.info("Arrmor %s listening on %s:%d", VERSION, config.host, config.port)
+    log.info("Arrmor %s listening on %s://%s:%d", VERSION,
+             "https" if config.tls else "http", config.host, config.port)
     if config.allowed_clients:
         log.info("  allowed clients: %s", ", ".join(map(str, config.allowed_clients)))
     else:

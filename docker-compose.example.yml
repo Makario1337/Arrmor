@@ -20,6 +20,11 @@ services:
       ARRMOR_RADARR_URL: http://radarr:7878
       ARRMOR_RADARR_API_KEY: ${RADARR_API_KEY}
       ARRMOR_RADARR_PROXY_KEY: ${RADARR_PROXY_KEY}
+      # Optional HTTPS (see README):
+      # ARRMOR_TLS_CERT: /certs/arrmor.crt
+      # ARRMOR_TLS_KEY: /certs/arrmor.key
+    # volumes:
+    #   - ./certs:/certs:ro
     networks: [arr]
 
   sonarr:

@@ -1,6 +1,10 @@
 import http.client
 import json
 import os
+import shutil
+import ssl
+import subprocess
+import tempfile
 import sys
 import threading
 import unittest
@@ -217,6 +221,71 @@ class ClientAllowListTest(unittest.TestCase):
         self.assertTrue(cfg.client_allowed("::ffff:192.168.1.7"))
         self.assertFalse(cfg.client_allowed("192.168.2.7"))
         self.assertFalse(cfg.client_allowed("garbage"))
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl CLI not available")
+class TlsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.cert = os.path.join(cls.tmp.name, "arrmor.crt")
+        cls.key = os.path.join(cls.tmp.name, "arrmor.key")
+        # Same command as in the README
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
+             "-keyout", cls.key, "-out", cls.cert, "-subj", "/CN=arrmor",
+             "-addext", "subjectAltName=IP:127.0.0.1"],
+            check=True, capture_output=True)
+        cls.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeArr)
+        threading.Thread(target=cls.upstream.serve_forever, daemon=True).start()
+        cfg = arrmor.load_config({
+            "ARRMOR_HOST": "127.0.0.1", "ARRMOR_PORT": "0",
+            "ARRMOR_TLS_CERT": cls.cert, "ARRMOR_TLS_KEY": cls.key,
+            "ARRMOR_RADARR_URL": f"http://127.0.0.1:{cls.upstream.server_port}",
+            "ARRMOR_RADARR_API_KEY": RADARR_KEY, "ARRMOR_RADARR_PROXY_KEY": RADARR_PROXY,
+        })
+        cls.proxy = arrmor.make_server(cfg)
+        threading.Thread(target=cls.proxy.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        for srv in (cls.proxy, cls.upstream):
+            srv.shutdown()
+            srv.server_close()
+        cls.tmp.cleanup()
+
+    def test_verified_https_request(self):
+        # Client trusts exactly this self-signed cert (like NODE_EXTRA_CA_CERTS)
+        ctx = ssl.create_default_context(cafile=self.cert)
+        conn = http.client.HTTPSConnection("127.0.0.1", self.proxy.server_port, context=ctx, timeout=5)
+        conn.request("GET", "/radarr/api/v3/qualityProfile", headers={"X-Api-Key": RADARR_PROXY})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+
+    def test_untrusted_client_rejects_cert(self):
+        ctx = ssl.create_default_context()  # system CAs only
+        conn = http.client.HTTPSConnection("127.0.0.1", self.proxy.server_port, context=ctx, timeout=5)
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            conn.request("GET", "/healthz")
+        conn.close()
+
+    def test_plain_http_fails(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=5)
+        with self.assertRaises((http.client.HTTPException, OSError)):
+            conn.request("GET", "/healthz")
+            conn.getresponse()
+        conn.close()
+
+    def test_tls_config_errors(self):
+        base = {**ConfigTest.base}
+        for env in ({**base, "ARRMOR_TLS_CERT": self.cert},
+                    {**base, "ARRMOR_TLS_KEY": self.key},
+                    {**base, "ARRMOR_TLS_CERT": self.key, "ARRMOR_TLS_KEY": self.cert},
+                    {**base, "ARRMOR_TLS_CERT": "/nope.crt", "ARRMOR_TLS_KEY": "/nope.key"}):
+            with self.assertRaises(arrmor.ConfigError):
+                arrmor.load_config(env)
 
 
 class ConfigTest(unittest.TestCase):

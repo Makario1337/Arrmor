@@ -47,6 +47,7 @@ Each instance is defined by a group of environment variables. `<NAME>` is upperc
 | `ARRMOR_<NAME>_TYPE` | no | `sonarr` or `radarr`; inferred if `<NAME>` starts with one of those |
 | `ARRMOR_<NAME>_EXTRA_ALLOW` | no | Comma-separated extra path regexes (GET only), use with care |
 | `ARRMOR_ALLOWED_CLIENTS` | no (recommended) | Comma-separated IPs/CIDRs allowed to connect, e.g. `192.168.50.10`. Empty = any client with a valid key |
+| `ARRMOR_TLS_CERT` / `ARRMOR_TLS_KEY` | no | Paths to certificate and key (PEM). If set, Arrmor serves HTTPS only, see [HTTPS](#https) |
 | `ARRMOR_PORT` | no | Listen port, default `8080` |
 | `ARRMOR_HOST` | no | Listen address, default `0.0.0.0` |
 | `ARRMOR_TIMEOUT` | no | Upstream timeout in seconds, default `60` |
@@ -82,17 +83,76 @@ openssl rand -hex 32   # run twice, once for SONARR_PROXY_KEY and once for RADAR
 
 ### Seerr settings
 
-In Seerr → Settings → Services → Sonarr / Radarr:
+In Seerr → Settings → Services → Add Radarr / Add Sonarr. Example for Arrmor running on `10.1.5.3`, port `8080`:
 
-| Field | Value |
+| Field | Radarr | Sonarr | Notes |
+|---|---|---|---|
+| Hostname or IP | `10.1.5.3` | `10.1.5.3` | **IP or hostname only** — no path, no port, no `http://` |
+| Port | `8080` | `8080` | The port Arrmor is reachable on (host side of the port mapping) |
+| Use SSL | off | off | On only if you enabled [HTTPS](#https) |
+| API Key | `RADARR_PROXY_KEY` | `SONARR_PROXY_KEY` | The **proxy** key from your `.env`, *not* the real Radarr/Sonarr key |
+| URL Base | `/radarr` | `/sonarr` | Selects the instance in Arrmor. Lowercase name of `ARRMOR_<NAME>_URL` |
+| External URL | optional | optional | Only used for links in your browser, e.g. the real Radarr address |
+
+> **Common mistake:** putting the path into the hostname field (`10.1.5.3/radarr`). Seerr builds the URL as `http(s)://<hostname>:<port><URL base>/api/v3/…`, so the path **must** go into *URL Base* and the hostname field must contain nothing but the IP/hostname.
+
+Then click **Test**. On success, quality profiles, root folders and tags load and the dialog can be saved. Requests that Seerr later tries to send to Sonarr/Radarr will fail — that is the point.
+
+#### Troubleshooting
+
+Watch `docker logs -f arrmor` while clicking **Test**:
+
+| Log line | Cause |
 |---|---|
-| Hostname or IP | LAN IP of the arr server, e.g. `192.168.1.10` |
-| Port | `8080` |
-| Use SSL | off |
-| URL Base | `/sonarr` (or `/radarr`, `/sonarr4k`, …) |
-| API Key | the matching `PROXY_KEY` |
+| *(nothing at all)* | Seerr does not reach Arrmor: wrong IP/port, firewall, port not published — or SSL checkbox doesn't match Arrmor's mode |
+| `GET / -> 404 (unknown prefix)` | URL Base empty or wrong (or path put into the hostname field) |
+| `-> 401 (bad or missing key …)` | Wrong API key — use the proxy key of *this* instance |
+| `-> 403 (client IP not allowed)` | `ARRMOR_ALLOWED_CLIENTS` doesn't contain the IP Seerr connects from (the log shows that IP) |
+| `-> 403 (not on … allow-list)` | Seerr needs an endpoint Arrmor doesn't allow yet — please open an issue with the log line |
+| `upstream … unreachable` | Arrmor can't reach Sonarr/Radarr: check `ARRMOR_<NAME>_URL` |
+| `GET /radarr/api/v3/system/status -> 200` | Connection works |
 
-Quality profile and root folder still load, so the dialog can be saved. Requests that Seerr tries to send to Sonarr/Radarr will fail — that is the point.
+## HTTPS
+
+Optional, but recommended when the traffic between DMZ and LAN could be sniffed. A self-signed certificate is enough.
+
+**1. Create a certificate on the arr server.** The IP (or DNS name) must be the address Seerr connects to:
+
+```sh
+mkdir certs
+openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+  -keyout certs/arrmor.key -out certs/arrmor.crt \
+  -subj "/CN=arrmor" -addext "subjectAltName=IP:10.1.5.3"
+chown 65534:65534 certs/arrmor.key && chmod 400 certs/arrmor.key   # container runs as uid 65534
+```
+
+For a DNS name use `subjectAltName=DNS:arrmor.lan` instead (or both: `IP:10.1.5.3,DNS:arrmor.lan`).
+
+**2. Enable it in Arrmor:**
+
+```yaml
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      ARRMOR_TLS_CERT: /certs/arrmor.crt
+      ARRMOR_TLS_KEY: /certs/arrmor.key
+```
+
+Arrmor then speaks HTTPS only (TLS 1.2+); plain HTTP requests fail.
+
+**3. Make Seerr trust the certificate.** Seerr is a Node.js app and rejects self-signed certificates by default. Copy **only `arrmor.crt`** (never the key) to the Seerr host and add it to Node's trust store:
+
+```yaml
+  seerr:
+    volumes:
+      - ./arrmor.crt:/certs/arrmor.crt:ro
+    environment:
+      NODE_EXTRA_CA_CERTS: /certs/arrmor.crt
+```
+
+Recreate the Seerr container, then tick **Use SSL** in the Sonarr/Radarr settings.
+
+Do **not** use `NODE_TLS_REJECT_UNAUTHORIZED=0` instead — it disables certificate checks for *all* of Seerr's connections (TMDB, Plex, Jellyfin, …).
 
 ## Network recommendations
 
@@ -102,7 +162,7 @@ Run Arrmor on the server that hosts Sonarr/Radarr. It only helps if Seerr cannot
 - **Docker bypasses host firewalls** like ufw for published ports. Enforce the rule on the router/firewall between the networks or in the `DOCKER-USER` iptables chain, and bind the port to the LAN IP (`-p 192.168.1.10:8080:8080`).
 - **Set `ARRMOR_ALLOWED_CLIENTS`** to the Seerr IP. Docker preserves the client source IP for published ports; if Seerr's traffic is NATed on the way, use the NAT address instead.
 - Ideally Sonarr/Radarr don't publish ports at all and are only reachable through the internal Docker network.
-- Traffic between Seerr and Arrmor is plain HTTP. The proxy key only grants read access, but other DMZ hosts on the same segment could sniff it.
+- Without [HTTPS](#https), traffic between Seerr and Arrmor is plain HTTP. The proxy key only grants read access, but other hosts on the path could sniff it.
 - Rotate the Sonarr/Radarr API keys once after setting up Arrmor, if Seerr knew them before.
 
 ## Development
