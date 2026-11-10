@@ -1,4 +1,5 @@
-# Example: Seerr in the DMZ can only reach Arrmor, Arrmor can reach Sonarr/Radarr.
+# Runs on the server that hosts Sonarr/Radarr (LAN).
+# Seerr lives in the DMZ and can only reach Arrmor's port - nothing else.
 # Put the secrets into a .env file next to this file (never commit it).
 
 services:
@@ -9,22 +10,27 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    ports:
+      - "192.168.1.10:8080:8080"   # bind to the LAN IP of this server only
     environment:
+      ARRMOR_ALLOWED_CLIENTS: 192.168.50.10   # IP of the Seerr host in the DMZ
       ARRMOR_SONARR_URL: http://sonarr:8989
       ARRMOR_SONARR_API_KEY: ${SONARR_API_KEY}     # real Sonarr key
       ARRMOR_SONARR_PROXY_KEY: ${SONARR_PROXY_KEY} # key Seerr uses (openssl rand -hex 32)
       ARRMOR_RADARR_URL: http://radarr:7878
       ARRMOR_RADARR_API_KEY: ${RADARR_API_KEY}
       ARRMOR_RADARR_PROXY_KEY: ${RADARR_PROXY_KEY}
-    networks: [dmz, arr]
-    # No "ports:" - Arrmor should only be reachable by Seerr, not the internet.
+    networks: [arr]
 
-  seerr:
-    image: ghcr.io/seerr-team/seerr:latest
-    networks: [dmz]   # Seerr is NOT in the arr network
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    networks: [arr]
+    # ...
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    networks: [arr]
     # ...
 
 networks:
-  dmz:
   arr:
-    external: true    # the network Sonarr/Radarr live in

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hmac
 import http.client
+import ipaddress
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 log = logging.getLogger("arrmor")
 
@@ -107,6 +108,18 @@ class Config:
     port: int
     timeout: float
     instances: list[Instance]
+    allowed_clients: list = field(default_factory=list)  # empty = everyone
+
+    def client_allowed(self, ip: str) -> bool:
+        if not self.allowed_clients:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        return any(addr in net for net in self.allowed_clients)
 
 
 def load_config(env: dict[str, str]) -> Config:
@@ -187,11 +200,20 @@ def load_config(env: dict[str, str]) -> Config:
     except ValueError:
         raise ConfigError("ARRMOR_PORT / ARRMOR_TIMEOUT must be numbers")
 
+    allowed_clients = []
+    for entry in env.get("ARRMOR_ALLOWED_CLIENTS", "").split(","):
+        if entry := entry.strip():
+            try:
+                allowed_clients.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                raise ConfigError(f"ARRMOR_ALLOWED_CLIENTS: invalid IP or CIDR {entry!r}")
+
     return Config(
         host=env.get("ARRMOR_HOST", "0.0.0.0"),
         port=port,
         timeout=timeout,
         instances=instances,
+        allowed_clients=allowed_clients,
     )
 
 
@@ -234,6 +256,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _deny_method(self) -> None:
         self.close_connection = True  # body (if any) is not read
+        if not self.config.client_allowed(self.client_address[0]):
+            return self._reply(403, "forbidden", reason="client IP not allowed")
         self._reply(405, "method not allowed", reason="write method")
 
     do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = _deny_method
@@ -241,8 +265,11 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------------- core
     def _handle(self) -> None:
         raw_path, _, raw_query = self.path.partition("?")
+        client = self.client_address[0]
 
-        if raw_path == "/healthz":
+        if raw_path == "/healthz" and (
+            self.config.client_allowed(client) or ipaddress.ip_address(client).is_loopback
+        ):
             body = b"ok\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -251,6 +278,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.command != "HEAD":
                 self.wfile.write(body)
             return
+
+        if not self.config.client_allowed(client):
+            self.close_connection = True
+            return self._reply(403, "forbidden", reason="client IP not allowed")
 
         if self.headers.get("Content-Length", "0") != "0" or "Transfer-Encoding" in self.headers:
             self.close_connection = True
@@ -385,6 +416,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     log.info("Arrmor %s listening on %s:%d", VERSION, config.host, config.port)
+    if config.allowed_clients:
+        log.info("  allowed clients: %s", ", ".join(map(str, config.allowed_clients)))
+    else:
+        log.warning("  ARRMOR_ALLOWED_CLIENTS not set - any client with a valid key is accepted")
     for i in config.instances:
         log.info("  %-10s (%s) -> %s://%s:%d%s", i.prefix, i.kind, i.scheme, i.host, i.port, i.base_path)
     try:

@@ -67,8 +67,9 @@ class ArrmorTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.proxy.shutdown()
-        cls.upstream.shutdown()
+        for srv in (cls.proxy, cls.upstream):
+            srv.shutdown()
+            srv.server_close()
 
     def setUp(self):
         FakeArr.requests.clear()
@@ -165,6 +166,52 @@ class ArrmorTest(unittest.TestCase):
         self.assertBlocked(400, "GET", "/sonarr/api/v3/series", {"X-Api-Key": SONARR_PROXY}, body=b"x")
 
 
+class ClientAllowListTest(unittest.TestCase):
+    def start(self, allowed):
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeArr)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        cfg = arrmor.load_config({
+            "ARRMOR_HOST": "127.0.0.1", "ARRMOR_PORT": "0",
+            "ARRMOR_ALLOWED_CLIENTS": allowed,
+            "ARRMOR_SONARR_URL": f"http://127.0.0.1:{upstream.server_port}",
+            "ARRMOR_SONARR_API_KEY": SONARR_KEY, "ARRMOR_SONARR_PROXY_KEY": SONARR_PROXY,
+        })
+        proxy = arrmor.make_server(cfg)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        for srv in (upstream, proxy):
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+        FakeArr.requests.clear()
+        return proxy.server_port
+
+    def req(self, port, method, path):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(method, path, headers={"X-Api-Key": SONARR_PROXY})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def test_foreign_client_blocked(self):
+        port = self.start("10.0.0.0/8, 192.168.1.5")
+        self.assertEqual(self.req(port, "GET", "/sonarr/api/v3/series"), 403)
+        self.assertEqual(self.req(port, "POST", "/sonarr/api/v3/series"), 403)
+        self.assertEqual(self.req(port, "GET", "/nothing"), 403)
+        self.assertEqual(FakeArr.requests, [])
+        # local healthcheck keeps working
+        self.assertEqual(self.req(port, "GET", "/healthz"), 200)
+
+    def test_allowed_client_passes(self):
+        port = self.start("127.0.0.1")
+        self.assertEqual(self.req(port, "GET", "/sonarr/api/v3/series"), 200)
+
+    def test_ipv4_mapped_ipv6(self):
+        cfg = arrmor.load_config({**ConfigTest.base, "ARRMOR_ALLOWED_CLIENTS": "192.168.1.0/24"})
+        self.assertTrue(cfg.client_allowed("::ffff:192.168.1.7"))
+        self.assertFalse(cfg.client_allowed("192.168.2.7"))
+        self.assertFalse(cfg.client_allowed("garbage"))
+
+
 class ConfigTest(unittest.TestCase):
     base = {"ARRMOR_SONARR_URL": "http://sonarr:8989", "ARRMOR_SONARR_API_KEY": SONARR_KEY,
             "ARRMOR_SONARR_PROXY_KEY": SONARR_PROXY}
@@ -192,6 +239,7 @@ class ConfigTest(unittest.TestCase):
             {**self.base, "ARRMOR_SONARR_URL": "ftp://x"},
             {**self.base, "ARRMOR_SONARR_URL": "http://u:p@x"},
             {**self.base, "ARRMOR_SONARR_EXTRA_ALLOW": "(["},
+            {**self.base, "ARRMOR_ALLOWED_CLIENTS": "not-an-ip"},
             {"ARRMOR_FOO_URL": "http://x", "ARRMOR_FOO_API_KEY": "a", "ARRMOR_FOO_PROXY_KEY": SONARR_PROXY},
             {**self.base, "ARRMOR_RADARR_URL": "http://r", "ARRMOR_RADARR_API_KEY": "x",
              "ARRMOR_RADARR_PROXY_KEY": SONARR_PROXY},
