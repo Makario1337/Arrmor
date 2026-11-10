@@ -1,0 +1,20 @@
+FROM python:3.13-alpine
+
+LABEL org.opencontainers.image.title="Arrmor" \
+      org.opencontainers.image.description="Read-only allow-list proxy between Seerr and Sonarr/Radarr" \
+      org.opencontainers.image.source="https://github.com/Makario1337/Arrmor" \
+      org.opencontainers.image.licenses="GPL-2.0"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ARRMOR_PORT=8080
+
+COPY arrmor.py /app/arrmor.py
+
+USER 65534:65534
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["python", "/app/arrmor.py", "--healthcheck"]
+
+ENTRYPOINT ["python", "/app/arrmor.py"]

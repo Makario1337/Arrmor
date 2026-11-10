@@ -1,0 +1,30 @@
+# Example: Seerr in the DMZ can only reach Arrmor, Arrmor can reach Sonarr/Radarr.
+# Put the secrets into a .env file next to this file (never commit it).
+
+services:
+  arrmor:
+    image: ghcr.io/makario1337/arrmor:latest
+    container_name: arrmor
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      ARRMOR_SONARR_URL: http://sonarr:8989
+      ARRMOR_SONARR_API_KEY: ${SONARR_API_KEY}     # real Sonarr key
+      ARRMOR_SONARR_PROXY_KEY: ${SONARR_PROXY_KEY} # key Seerr uses (openssl rand -hex 32)
+      ARRMOR_RADARR_URL: http://radarr:7878
+      ARRMOR_RADARR_API_KEY: ${RADARR_API_KEY}
+      ARRMOR_RADARR_PROXY_KEY: ${RADARR_PROXY_KEY}
+    networks: [dmz, arr]
+    # No "ports:" - Arrmor should only be reachable by Seerr, not the internet.
+
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    networks: [dmz]   # Seerr is NOT in the arr network
+    # ...
+
+networks:
+  dmz:
+  arr:
+    external: true    # the network Sonarr/Radarr live in
