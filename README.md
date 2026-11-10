@@ -79,7 +79,7 @@ Multiple instances (e.g. a 4K Sonarr) are just another group: `ARRMOR_SONARR4K_U
 
 ## Usage
 
-Image tags: `latest` = newest release, `1` / `1.1` / `1.1.0` = pinned release, `edge` = current `main`. Images are built for `amd64`, `arm64` and `armv7`.
+Image tags: `latest` = newest release, `1` / `1.1` / `1.1.1` = pinned release, `edge` = current `main`. Images are built for `amd64`, `arm64` and `armv7`.
 
 ```sh
 docker run -d --name arrmor --read-only \
